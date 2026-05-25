@@ -1,0 +1,17 @@
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+supabase
+scikit-learn
+joblib
+pandas
+numpy
+scipy
+statsmodels
+tensorflow
+keras
+python-dotenv
+httpx
+pytest
+pytest-asyncio
