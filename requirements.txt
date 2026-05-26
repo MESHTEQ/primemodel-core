@@ -3,7 +3,10 @@ uvicorn[standard]
 pydantic
 pydantic-settings
 supabase==2.30.0
-storage3==0.7.7
+# storage3 pinned to match supabase==2.30.0 requirement (Linux/Docker compatible)
+# NOTE: On Windows dev machine, storage3 must be installed at 0.7.7 due to pyiceberg build failure
+# Do not change this line — it is correct for Docker/Railway deployment
+storage3==2.30.0
 scikit-learn
 joblib
 pandas

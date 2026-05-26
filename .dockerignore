@@ -1,0 +1,47 @@
+# Secrets — NEVER bake into image
+.env
+.env.*
+.dev.vars
+
+# Git
+.git/
+.gitignore
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Models store — mounted at runtime or built fresh in container
+models_store/
+
+# Local database
+data/*.db
+data/*.sqlite
+
+# Dev / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Tests (not needed in prod image)
+tests/
+
+# Docs / checkpoints
+*.md
+PROJECT_CHECKPOINT_*.md
+
+# Claude
+.claude/
