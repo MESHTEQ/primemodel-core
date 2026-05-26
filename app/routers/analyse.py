@@ -1,24 +1,20 @@
 """
 app/routers/analyse.py
 -----------------------
-POST /analyse — core endpoint.
+POST /analyse        — sensor-agnostic analysis endpoint (new)
+POST /analyse/legacy — original water-meter endpoint (retained)
 
-Called by the Supabase Edge Function on every ThingPark uplink.
-Orchestrates the full analysis pipeline:
+New endpoint:
+    Accepts any LoRaWAN sensor by deveui. Looks up device type from the
+    device registry, fetches history from lorawan_uplinks, decodes numeric
+    parameters, and runs the full Layer 1–4 pipeline on each parameter.
 
-1. Decode raw payload (if present)
-2. Persist uplink to Supabase
-3. Load meter state from model registry
-4. Run statistical layer (always)
-5. Run LSTM Autoencoder (if active)
-6. Run LSTM Forecast (if active)
-7. Run 1D CNN (if active)
-8. Compute ensemble score
-9. Compute RUL (battery + drift)
-10. Build and return AnalyseResponse
+Legacy endpoint:
+    Original water-meter-specific pipeline (Panda/Bove decoders, MNF window,
+    battery RUL, drift RUL). Kept intact — do not modify.
 
-Design principles:
-    - Any individual layer failure is caught and logged — it never crashes the endpoint
+Design principles (both endpoints):
+    - Any individual layer failure is caught and logged — never crashes the endpoint
     - Warming-up layers return score=0.0 and are excluded from the ensemble
     - State is persisted to disk after every uplink
     - Supabase writes are fire-and-forget with error logging, never blocking the response
@@ -30,7 +26,16 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException
 from datetime import datetime, timezone
 
-from app.schemas.uplink import AnalyseRequest, AnalyseResponse, ModelLayerStatuses
+# Legacy schemas (water meter)
+from app.schemas.uplink import (
+    AnalyseRequest as LegacyAnalyseRequest,
+    AnalyseResponse as LegacyAnalyseResponse,
+    ModelLayerStatuses,
+)
+
+# New sensor-agnostic schemas
+from app.schemas.analyse import AnalyseRequest, AnalyseResponse
+
 from app.config import get_settings
 from app.utils.logger import get_logger
 from app.utils.time_utils import parse_iso_timestamp, days_between, is_in_mnf_window
@@ -44,10 +49,11 @@ from app.services import (
     battery_rul,
     drift_rul,
 )
+from app.services import decoder_registry, device_registry
 from app.services.statistical import isolation_forest, mnf_cusum, mnf_ewma, burst_detector
 from app.services.neural import lstm_autoencoder, lstm_forecast, cnn_pattern
 
-# Decoders
+# Legacy decoders
 from app.services.decoder_panda import decode as decode_panda
 from app.services.decoder_bove import decode as decode_bove
 
@@ -55,8 +61,347 @@ logger = get_logger(__name__)
 router = APIRouter()
 
 
+# ===========================================================================
+# NEW — Sensor-agnostic POST /analyse
+# ===========================================================================
+
 @router.post("/", response_model=AnalyseResponse, tags=["Analysis"])
 def analyse(request: AnalyseRequest) -> AnalyseResponse:
+    """
+    Sensor-agnostic analysis endpoint.
+
+    Accepts any registered LoRaWAN device by deveui. Looks up device type,
+    fetches history from lorawan_uplinks, decodes numeric parameters, and
+    runs the progressive Layer 1–4 pipeline on each parameter time series.
+
+    Args:
+        request: AnalyseRequest with deveui and optional client_id / force_layers.
+
+    Returns:
+        AnalyseResponse with per-parameter scores, ensemble score, and metadata.
+    """
+    settings = get_settings()
+    deveui = request.deveui.upper().strip()
+    analysis_timestamp = datetime.now(tz=timezone.utc).isoformat()
+
+    # ------------------------------------------------------------------
+    # Step 1: Resolve device type
+    # ------------------------------------------------------------------
+    device_info = device_registry.get_device_info(deveui)
+    device_type = device_info["device_type"]
+
+    # ------------------------------------------------------------------
+    # Step 2: Fetch sensor history from lorawan_uplinks
+    # ------------------------------------------------------------------
+    rows = supabase_client.fetch_sensor_history(deveui, limit=500)
+
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No data found for device {deveui}",
+        )
+
+    # ------------------------------------------------------------------
+    # Step 3: Decode each row — extract numeric parameters only
+    # ------------------------------------------------------------------
+    decoder = decoder_registry.get_decoder(device_type)
+
+    # Build per-parameter time series: {param: [(created_at, value), ...]}
+    param_series: dict = {}
+    timestamps: list = []
+
+    for row in rows:
+        payload = row.get("decoded_payload") or {}
+        created_at = row.get("created_at", "")
+        if created_at:
+            timestamps.append(created_at)
+
+        numeric = decoder(payload)
+        for param, value in numeric.items():
+            if param not in param_series:
+                param_series[param] = []
+            param_series[param].append((created_at, value))
+
+    parameters_analysed = list(param_series.keys())
+    readings_used = len(rows)
+
+    # ------------------------------------------------------------------
+    # Step 4: Calculate days_of_data
+    # ------------------------------------------------------------------
+    days_of_data = 0.0
+    if len(timestamps) >= 2:
+        try:
+            first_dt = parse_iso_timestamp(timestamps[0])
+            last_dt = parse_iso_timestamp(timestamps[-1])
+            days_of_data = days_between(first_dt, last_dt)
+        except Exception as e:
+            logger.warning("Could not compute days_of_data", extra={"deveui": deveui, "error": str(e)})
+
+    logger.info(
+        f"Analysing device {deveui} ({device_type}) — {readings_used} readings, {days_of_data:.1f} days",
+        extra={"deveui": deveui, "device_type": device_type, "readings": readings_used, "days": days_of_data},
+    )
+
+    # ------------------------------------------------------------------
+    # Step 5: Determine active layers
+    # ------------------------------------------------------------------
+    force_layers = set(request.force_layers or [])
+
+    stat_active   = days_of_data >= settings.cold_start_days        or "statistical"    in force_layers
+    ae_active     = days_of_data >= settings.lstm_ae_activation_days or "lstm_ae"        in force_layers
+    fc_active     = days_of_data >= settings.lstm_forecast_activation_days or "lstm_forecast" in force_layers
+    cnn_active    = days_of_data >= settings.cnn_activation_days     or "cnn"            in force_layers
+
+    active_layers: list = []
+    if stat_active:
+        active_layers.append("statistical")
+    if ae_active:
+        active_layers.append("lstm_ae")
+    if fc_active:
+        active_layers.append("lstm_forecast")
+    if cnn_active:
+        active_layers.append("cnn")
+
+    # ------------------------------------------------------------------
+    # Step 6: Layer 1 — Statistical analysis per parameter
+    # Skip MNF analysis unless device_type contains "water"
+    # ------------------------------------------------------------------
+    layer1_scores: dict = {}
+    anomaly_details: dict = {}
+    is_water_device = "water" in device_type.lower()
+
+    for param, series in param_series.items():
+        if not stat_active:
+            layer1_scores[param] = 0.0
+            continue
+
+        values = [v for (_, v) in series]
+        if len(values) < 2:
+            layer1_scores[param] = 0.0
+            continue
+
+        param_score = 0.0
+        param_flags = {}
+
+        # Build a minimal DataFrame for this parameter
+        param_df = pd.DataFrame({
+            "timestamp": [ts for (ts, _) in series],
+            "flow_rate": values,   # reuse flow_rate column name for compatibility
+        })
+
+        # --- Isolation Forest ---
+        try:
+            prev_val = values[-2] if len(values) >= 2 else values[-1]
+            val_delta = values[-1] - prev_val
+            rolling_mean, rolling_std = feature_engineering.compute_rolling_stats(values)
+            try:
+                current_dt = parse_iso_timestamp(series[-1][0])
+            except Exception:
+                current_dt = datetime.now(tz=timezone.utc)
+            hour_of_day = current_dt.hour + current_dt.minute / 60.0
+            day_of_week = current_dt.weekday()
+            feat_vec = feature_engineering.build_feature_vector(
+                flow_rate=values[-1],
+                flow_delta=val_delta,
+                hour_of_day=hour_of_day,
+                day_of_week=day_of_week,
+                rolling_mean_1h=rolling_mean,
+                rolling_std_1h=rolling_std,
+            )
+            # Load or train per-device-per-param model key
+            model_key = f"{deveui}_{param}"
+            if_model = isolation_forest.load_model(settings.model_store_path, model_key)
+            if if_model is None and len(values) >= 50:
+                flows = np.array(values, dtype=float)
+                deltas = np.concatenate([[0.0], np.diff(flows)])
+                X = np.column_stack([
+                    flows,
+                    deltas,
+                    np.full(len(flows), hour_of_day),
+                    np.full(len(flows), day_of_week),
+                    pd.Series(flows).rolling(4, min_periods=1).mean().values,
+                    pd.Series(flows).rolling(4, min_periods=1).std().fillna(0).values,
+                ])
+                if_model = isolation_forest.train(X, contamination=settings.isolation_forest_contamination)
+                isolation_forest.save_model(if_model, settings.model_store_path, model_key)
+
+            if if_model is not None:
+                if_score, is_if_anomaly = isolation_forest.score(if_model, feat_vec)
+                param_score = max(param_score, if_score)
+                if is_if_anomaly:
+                    param_flags["isolation_forest"] = True
+        except Exception as e:
+            logger.warning("IF scoring failed", extra={"deveui": deveui, "param": param, "error": str(e)})
+
+        # --- Burst detection ---
+        try:
+            if len(values) >= 10:
+                burst_state = burst_detector.initialise_state(values)
+                prev_val = values[-2] if len(values) >= 2 else values[-1]
+                burst_score_val, burst_detected = burst_detector.detect(
+                    burst_state, values[-1], prev_val, settings.burst_threshold_sigma
+                )
+                param_score = max(param_score, burst_score_val)
+                if burst_detected:
+                    param_flags["burst_detected"] = True
+        except Exception as e:
+            logger.warning("Burst detection failed", extra={"deveui": deveui, "param": param, "error": str(e)})
+
+        # --- MNF / CUSUM / EWMA — water devices only ---
+        if is_water_device:
+            try:
+                current_dt_parsed = parse_iso_timestamp(series[-1][0])
+                in_mnf_window = is_in_mnf_window(
+                    current_dt_parsed,
+                    settings.mnf_window_start,
+                    settings.mnf_window_end,
+                )
+                if in_mnf_window:
+                    daily_mnf = feature_engineering.extract_daily_mnf(
+                        param_df,
+                        window_start_hour=settings.mnf_window_start,
+                        window_end_hour=settings.mnf_window_end,
+                    )
+                    if len(daily_mnf) >= 3:
+                        cusum_state = mnf_cusum.initialise_state(daily_mnf.values)
+                        cusum_state, cusum_score, mnf_flag_cusum = mnf_cusum.update(
+                            cusum_state, values[-1], settings.cusum_threshold_sigma
+                        )
+                        ewma_state = mnf_ewma.initialise_state(daily_mnf.values, settings.ewma_lambda)
+                        ewma_state, ewma_score, mnf_flag_ewma = mnf_ewma.update(
+                            ewma_state, values[-1], settings.cusum_threshold_sigma
+                        )
+                        mnf_score = max(cusum_score, ewma_score)
+                        param_score = max(param_score, mnf_score)
+                        if mnf_flag_cusum or mnf_flag_ewma:
+                            param_flags["mnf_flag"] = True
+            except Exception as e:
+                logger.warning("MNF analysis failed", extra={"deveui": deveui, "param": param, "error": str(e)})
+
+        layer1_scores[param] = round(min(param_score, 1.0), 4)
+        if param_flags:
+            anomaly_details[param] = param_flags
+
+    # ------------------------------------------------------------------
+    # Step 7: Layer 2 — LSTM Autoencoder
+    # Uses the first available parameter as primary time series
+    # ------------------------------------------------------------------
+    layer2_score: Optional[float] = None
+    if ae_active and parameters_analysed:
+        try:
+            primary_param = parameters_analysed[0]
+            primary_values = [v for (_, v) in param_series[primary_param]]
+            primary_df = pd.DataFrame({"timestamp": [ts for (ts, _) in param_series[primary_param]], "flow_rate": primary_values})
+            sequence = feature_engineering.build_lstm_sequence(primary_df)
+            if sequence is not None:
+                ae_model_key = f"{deveui}_{primary_param}"
+                ae_model = lstm_autoencoder.load_model(settings.model_store_path, ae_model_key)
+                if ae_model is not None:
+                    ae_threshold_stats = {"mae_mean": 0.0, "mae_std": 1.0, "threshold": 1.0}
+                    ae_score_val, _ = lstm_autoencoder.score(ae_model, sequence, ae_threshold_stats)
+                    layer2_score = round(float(ae_score_val), 4)
+        except Exception as e:
+            logger.warning("LSTM AE scoring failed", extra={"deveui": deveui, "error": str(e)})
+
+    # ------------------------------------------------------------------
+    # Step 8: Layer 3 — LSTM Forecast
+    # ------------------------------------------------------------------
+    layer3_score: Optional[float] = None
+    if fc_active and parameters_analysed:
+        try:
+            primary_param = parameters_analysed[0]
+            primary_values = [v for (_, v) in param_series[primary_param]]
+            primary_df = pd.DataFrame({"timestamp": [ts for (ts, _) in param_series[primary_param]], "flow_rate": primary_values})
+            if len(primary_df) >= feature_engineering.SEQUENCE_LENGTH + 4:
+                context_seq = feature_engineering.build_lstm_sequence(primary_df.iloc[:-4])
+                actual_next = primary_df["flow_rate"].values[-4:].astype(np.float32)
+                if context_seq is not None:
+                    fc_model_key = f"{deveui}_{primary_param}"
+                    fc_model = lstm_forecast.load_model(settings.model_store_path, fc_model_key)
+                    if fc_model is not None:
+                        fc_baseline = {"rmse_mean": 0.0, "rmse_std": 1.0}
+                        fc_score_val, _ = lstm_forecast.score(fc_model, context_seq, actual_next, fc_baseline)
+                        layer3_score = round(float(fc_score_val), 4)
+        except Exception as e:
+            logger.warning("LSTM Forecast scoring failed", extra={"deveui": deveui, "error": str(e)})
+
+    # ------------------------------------------------------------------
+    # Step 9: Layer 4 — CNN Pattern
+    # ------------------------------------------------------------------
+    layer4_score: Optional[float] = None
+    if cnn_active and parameters_analysed:
+        try:
+            primary_param = parameters_analysed[0]
+            primary_values = [v for (_, v) in param_series[primary_param]]
+            primary_df = pd.DataFrame({"timestamp": [ts for (ts, _) in param_series[primary_param]], "flow_rate": primary_values})
+            cnn_sequence = feature_engineering.build_cnn_sequence(primary_df)
+            if cnn_sequence is not None:
+                cnn_model = cnn_pattern.load_model(settings.model_store_path, deveui)
+                if cnn_model is not None:
+                    cnn_score_val, _ = cnn_pattern.score(cnn_model, cnn_sequence)
+                    layer4_score = round(float(cnn_score_val), 4)
+        except Exception as e:
+            logger.warning("CNN scoring failed", extra={"deveui": deveui, "error": str(e)})
+
+    # ------------------------------------------------------------------
+    # Step 10: Ensemble score
+    # ------------------------------------------------------------------
+    ensemble_score: Optional[float] = None
+    anomaly_detected = False
+
+    try:
+        # Compute a single statistical_score from layer1 scores (mean across params)
+        stat_score = float(np.mean(list(layer1_scores.values()))) if layer1_scores else 0.0
+
+        ensemble_result = ensemble.compute_ensemble(
+            statistical_score=stat_score,
+            autoencoder_score=layer2_score or 0.0,
+            forecast_score=layer3_score or 0.0,
+            cnn_score=layer4_score or 0.0,
+            statistical_active=stat_active,
+            lstm_ae_active=ae_active and layer2_score is not None,
+            lstm_forecast_active=fc_active and layer3_score is not None,
+            cnn_active=cnn_active and layer4_score is not None,
+        )
+        ensemble_score = round(float(ensemble_result["leak_probability"]), 4)
+        anomaly_detected = ensemble_result["leak_severity"] not in ("none",)
+    except Exception as e:
+        logger.warning("Ensemble scoring failed", extra={"deveui": deveui, "error": str(e)})
+
+    # ------------------------------------------------------------------
+    # Step 11: Build response and write result (stubbed)
+    # ------------------------------------------------------------------
+    response = AnalyseResponse(
+        deveui=deveui,
+        device_type=device_type,
+        parameters_analysed=parameters_analysed,
+        readings_used=readings_used,
+        days_of_data=round(days_of_data, 2),
+        layer1_scores=layer1_scores,
+        layer2_score=layer2_score,
+        layer3_score=layer3_score,
+        layer4_score=layer4_score,
+        ensemble_score=ensemble_score,
+        anomaly_detected=anomaly_detected,
+        anomaly_details=anomaly_details if anomaly_details else None,
+        analysis_timestamp=analysis_timestamp,
+        active_layers=active_layers,
+    )
+
+    try:
+        supabase_client.write_analysis_result(deveui, response.model_dump())
+    except Exception as e:
+        logger.error("write_analysis_result failed (non-fatal)", extra={"deveui": deveui, "error": str(e)})
+
+    return response
+
+
+# ===========================================================================
+# LEGACY — Water-meter POST /analyse/legacy (original code, untouched)
+# ===========================================================================
+
+@router.post("/legacy", response_model=LegacyAnalyseResponse, tags=["Analysis (Legacy)"])
+def analyse_legacy(request: LegacyAnalyseRequest) -> LegacyAnalyseResponse:
     """
     Analyse a single meter uplink and return a scored result.
 
@@ -129,7 +474,7 @@ def analyse(request: AnalyseRequest) -> AnalyseResponse:
     # ------------------------------------------------------------------
     # Step 4: Fetch uplink history for feature computation
     # ------------------------------------------------------------------
-    history_rows = supabase_client.fetch_uplink_history(meter_id, client_id, limit=500)
+    history_rows = supabase_client.fetch_uplink_history_legacy(meter_id, client_id, limit=500)
     history_df = pd.DataFrame(history_rows) if history_rows else pd.DataFrame(
         columns=["timestamp", "flow_rate", "cumulative_volume", "battery_level"]
     )

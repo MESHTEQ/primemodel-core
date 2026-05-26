@@ -54,13 +54,16 @@ def _get_client():
 # Uplink history
 # ---------------------------------------------------------------------------
 
-def fetch_uplink_history(
+def fetch_uplink_history_legacy(
     meter_id: str,
     client_id: str,
     limit: int = 500,
 ) -> List[Dict[str, Any]]:
     """
-    Fetch recent uplink records for a meter from Supabase.
+    [LEGACY] Fetch recent uplink records for a water meter from the "uplinks" table.
+
+    Retained for backward compatibility with the legacy /analyse/legacy endpoint.
+    New code should use fetch_sensor_history() which queries lorawan_uplinks.
 
     Args:
         meter_id: Meter identifier.
@@ -87,10 +90,90 @@ def fetch_uplink_history(
         return list(reversed(rows))
     except Exception as e:
         logger.error(
-            "Failed to fetch uplink history",
+            "Failed to fetch uplink history (legacy)",
             extra={"meter_id": meter_id, "client_id": client_id, "error": str(e)},
         )
         return []
+
+
+def fetch_sensor_history(
+    deveui: str,
+    limit: int = 500,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch recent uplink records for any LoRaWAN sensor from the lorawan_uplinks table.
+
+    This is the primary history fetch function for the sensor-agnostic /analyse endpoint.
+    Returns rows ordered chronologically (oldest first).
+
+    Args:
+        deveui: Device EUI string — used to filter rows.
+        limit: Maximum number of rows to return.
+
+    Returns:
+        List of dicts with keys: deveui, decoded_payload (dict), created_at (str).
+        Returns empty list on error or no data.
+    """
+    try:
+        client = _get_client()
+        response = (
+            client.table("lorawan_uplinks")
+            .select("deveui, decoded_payload, created_at")
+            .eq("deveui", deveui)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        rows = response.data or []
+        # Return in chronological order (oldest first)
+        return list(reversed(rows))
+    except Exception as e:
+        logger.error(
+            "Failed to fetch sensor history",
+            extra={"deveui": deveui, "error": str(e)},
+        )
+        return []
+
+
+def write_analysis_result(
+    deveui: str,
+    result: dict,
+) -> bool:
+    """
+    Write an analysis result to the analysis_results table.
+
+    # TODO: Create analysis_results table in Supabase and enable write.
+    Table schema (planned):
+        id          bigint (auto)
+        deveui      text
+        created_at  timestamptz
+        result      jsonb   ← full AnalyseResponse dict
+
+    For now, logs the result and returns True without writing to Supabase.
+
+    Args:
+        deveui: Device EUI string.
+        result: Dict representation of AnalyseResponse.
+
+    Returns:
+        True always (write is stubbed).
+    """
+    logger.info(
+        "Analysis result (write stubbed — table not yet created)",
+        extra={"deveui": deveui, "ensemble_score": result.get("ensemble_score"), "anomaly_detected": result.get("anomaly_detected")},
+    )
+    # TODO: Uncomment once analysis_results table is created in Supabase:
+    # try:
+    #     client = _get_client()
+    #     client.table("analysis_results").insert({
+    #         "deveui": deveui,
+    #         "created_at": datetime.now(tz=timezone.utc).isoformat(),
+    #         "result": result,
+    #     }).execute()
+    # except Exception as e:
+    #     logger.error("Failed to write analysis result", extra={"deveui": deveui, "error": str(e)})
+    #     return False
+    return True
 
 
 def insert_uplink(
