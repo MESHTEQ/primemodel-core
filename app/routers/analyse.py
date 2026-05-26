@@ -93,7 +93,7 @@ def analyse(request: AnalyseRequest) -> AnalyseResponse:
     # ------------------------------------------------------------------
     # Step 2: Fetch sensor history from lorawan_uplinks
     # ------------------------------------------------------------------
-    rows = supabase_client.fetch_sensor_history(deveui, limit=500)
+    rows = supabase_client.fetch_sensor_history(deveui)
 
     if not rows:
         raise HTTPException(
@@ -144,17 +144,18 @@ def analyse(request: AnalyseRequest) -> AnalyseResponse:
 
     # ------------------------------------------------------------------
     # Step 5: Determine active layers
+    # Layer 1 (IF + Burst): data-count based — no calendar gate
+    # Layers 2/3/4: calendar based (30/60/90 days) — unchanged
     # ------------------------------------------------------------------
     force_layers = set(request.force_layers or [])
 
-    stat_active   = days_of_data >= settings.cold_start_days        or "statistical"    in force_layers
-    ae_active     = days_of_data >= settings.lstm_ae_activation_days or "lstm_ae"        in force_layers
-    fc_active     = days_of_data >= settings.lstm_forecast_activation_days or "lstm_forecast" in force_layers
-    cnn_active    = days_of_data >= settings.cnn_activation_days     or "cnn"            in force_layers
+    # Layers 2–4 still use calendar thresholds
+    ae_active  = days_of_data >= settings.lstm_ae_activation_days         or "lstm_ae"        in force_layers
+    fc_active  = days_of_data >= settings.lstm_forecast_activation_days   or "lstm_forecast"  in force_layers
+    cnn_active = days_of_data >= settings.cnn_activation_days             or "cnn"            in force_layers
 
+    # Layer 1 active_layers entry added after the loop once we know if any method ran
     active_layers: list = []
-    if stat_active:
-        active_layers.append("statistical")
     if ae_active:
         active_layers.append("lstm_ae")
     if fc_active:
@@ -164,17 +165,20 @@ def analyse(request: AnalyseRequest) -> AnalyseResponse:
 
     # ------------------------------------------------------------------
     # Step 6: Layer 1 — Statistical analysis per parameter
-    # Skip MNF analysis unless device_type contains "water"
+    #
+    # Activation rules (independent per method — no shared calendar gate):
+    #   Isolation Forest: trains and scores when len(values) >= 50
+    #   Burst Detector:   runs when len(values) >= 10
+    #   CUSUM / EWMA:     water devices only, existing calendar + MNF window logic
+    #
+    # "statistical" is added to active_layers if at least one method ran.
     # ------------------------------------------------------------------
     layer1_scores: dict = {}
     anomaly_details: dict = {}
     is_water_device = "water" in device_type.lower()
+    layer1_ran = False   # tracks whether any stat method produced a real score
 
     for param, series in param_series.items():
-        if not stat_active:
-            layer1_scores[param] = 0.0
-            continue
-
         values = [v for (_, v) in series]
         if len(values) < 2:
             layer1_scores[param] = 0.0
@@ -186,69 +190,81 @@ def analyse(request: AnalyseRequest) -> AnalyseResponse:
         # Build a minimal DataFrame for this parameter
         param_df = pd.DataFrame({
             "timestamp": [ts for (ts, _) in series],
-            "flow_rate": values,   # reuse flow_rate column name for compatibility
+            "flow_rate": values,   # reuse flow_rate column name for compat with feature_engineering
         })
 
-        # --- Isolation Forest ---
-        try:
-            prev_val = values[-2] if len(values) >= 2 else values[-1]
-            val_delta = values[-1] - prev_val
-            rolling_mean, rolling_std = feature_engineering.compute_rolling_stats(values)
+        # --- Isolation Forest — activates at >= 50 readings ---
+        if len(values) >= 50 or "statistical" in force_layers:
             try:
-                current_dt = parse_iso_timestamp(series[-1][0])
-            except Exception:
-                current_dt = datetime.now(tz=timezone.utc)
-            hour_of_day = current_dt.hour + current_dt.minute / 60.0
-            day_of_week = current_dt.weekday()
-            feat_vec = feature_engineering.build_feature_vector(
-                flow_rate=values[-1],
-                flow_delta=val_delta,
-                hour_of_day=hour_of_day,
-                day_of_week=day_of_week,
-                rolling_mean_1h=rolling_mean,
-                rolling_std_1h=rolling_std,
-            )
-            # Load or train per-device-per-param model key
-            model_key = f"{deveui}_{param}"
-            if_model = isolation_forest.load_model(settings.model_store_path, model_key)
-            if if_model is None and len(values) >= 50:
-                flows = np.array(values, dtype=float)
-                deltas = np.concatenate([[0.0], np.diff(flows)])
-                X = np.column_stack([
-                    flows,
-                    deltas,
-                    np.full(len(flows), hour_of_day),
-                    np.full(len(flows), day_of_week),
-                    pd.Series(flows).rolling(4, min_periods=1).mean().values,
-                    pd.Series(flows).rolling(4, min_periods=1).std().fillna(0).values,
-                ])
-                if_model = isolation_forest.train(X, contamination=settings.isolation_forest_contamination)
-                isolation_forest.save_model(if_model, settings.model_store_path, model_key)
+                prev_val = values[-2] if len(values) >= 2 else values[-1]
+                val_delta = values[-1] - prev_val
+                rolling_mean, rolling_std = feature_engineering.compute_rolling_stats(values)
+                try:
+                    current_dt = parse_iso_timestamp(series[-1][0])
+                except Exception:
+                    current_dt = datetime.now(tz=timezone.utc)
+                hour_of_day = current_dt.hour + current_dt.minute / 60.0
+                day_of_week = current_dt.weekday()
+                feat_vec = feature_engineering.build_feature_vector(
+                    flow_rate=values[-1],
+                    flow_delta=val_delta,
+                    hour_of_day=hour_of_day,
+                    day_of_week=day_of_week,
+                    rolling_mean_1h=rolling_mean,
+                    rolling_std_1h=rolling_std,
+                )
+                model_key = f"{deveui}_{param}"
+                if_model = isolation_forest.load_model(settings.model_store_path, model_key)
+                if if_model is None:
+                    # Train on full history and score in the same request
+                    flows = np.array(values, dtype=float)
+                    deltas = np.concatenate([[0.0], np.diff(flows)])
+                    hours_arr = pd.to_datetime(
+                        [ts for (ts, _) in series], utc=True, errors="coerce"
+                    ).hour + pd.to_datetime(
+                        [ts for (ts, _) in series], utc=True, errors="coerce"
+                    ).minute / 60.0
+                    dows_arr = pd.to_datetime(
+                        [ts for (ts, _) in series], utc=True, errors="coerce"
+                    ).dayofweek
+                    X = np.column_stack([
+                        flows,
+                        deltas,
+                        hours_arr.to_numpy(dtype=float),
+                        dows_arr.to_numpy(dtype=float),
+                        pd.Series(flows).rolling(4, min_periods=1).mean().values,
+                        pd.Series(flows).rolling(4, min_periods=1).std().fillna(0).values,
+                    ])
+                    if_model = isolation_forest.train(X, contamination=settings.isolation_forest_contamination)
+                    isolation_forest.save_model(if_model, settings.model_store_path, model_key)
+                    logger.info("IF trained and scoring in same request", extra={"deveui": deveui, "param": param, "n": len(values)})
 
-            if if_model is not None:
+                # Score immediately — whether freshly trained or loaded from disk
                 if_score, is_if_anomaly = isolation_forest.score(if_model, feat_vec)
                 param_score = max(param_score, if_score)
+                layer1_ran = True
                 if is_if_anomaly:
                     param_flags["isolation_forest"] = True
-        except Exception as e:
-            logger.warning("IF scoring failed", extra={"deveui": deveui, "param": param, "error": str(e)})
+            except Exception as e:
+                logger.warning("IF scoring failed", extra={"deveui": deveui, "param": param, "error": str(e)})
 
-        # --- Burst detection ---
-        try:
-            if len(values) >= 10:
+        # --- Burst Detector — activates at >= 10 readings ---
+        if len(values) >= 10 or "statistical" in force_layers:
+            try:
                 burst_state = burst_detector.initialise_state(values)
                 prev_val = values[-2] if len(values) >= 2 else values[-1]
-                burst_score_val, burst_detected = burst_detector.detect(
+                burst_score_val, burst_detected_flag = burst_detector.detect(
                     burst_state, values[-1], prev_val, settings.burst_threshold_sigma
                 )
                 param_score = max(param_score, burst_score_val)
-                if burst_detected:
+                layer1_ran = True
+                if burst_detected_flag:
                     param_flags["burst_detected"] = True
-        except Exception as e:
-            logger.warning("Burst detection failed", extra={"deveui": deveui, "param": param, "error": str(e)})
+            except Exception as e:
+                logger.warning("Burst detection failed", extra={"deveui": deveui, "param": param, "error": str(e)})
 
-        # --- MNF / CUSUM / EWMA — water devices only ---
-        if is_water_device:
+        # --- CUSUM / EWMA — water devices only, calendar + MNF window gate unchanged ---
+        if is_water_device and days_of_data >= settings.cold_start_days:
             try:
                 current_dt_parsed = parse_iso_timestamp(series[-1][0])
                 in_mnf_window = is_in_mnf_window(
@@ -273,6 +289,7 @@ def analyse(request: AnalyseRequest) -> AnalyseResponse:
                         )
                         mnf_score = max(cusum_score, ewma_score)
                         param_score = max(param_score, mnf_score)
+                        layer1_ran = True
                         if mnf_flag_cusum or mnf_flag_ewma:
                             param_flags["mnf_flag"] = True
             except Exception as e:
@@ -281,6 +298,10 @@ def analyse(request: AnalyseRequest) -> AnalyseResponse:
         layer1_scores[param] = round(min(param_score, 1.0), 4)
         if param_flags:
             anomaly_details[param] = param_flags
+
+    # Add "statistical" to active_layers if at least one method ran
+    if layer1_ran:
+        active_layers.insert(0, "statistical")
 
     # ------------------------------------------------------------------
     # Step 7: Layer 2 — LSTM Autoencoder
@@ -358,7 +379,7 @@ def analyse(request: AnalyseRequest) -> AnalyseResponse:
             autoencoder_score=layer2_score or 0.0,
             forecast_score=layer3_score or 0.0,
             cnn_score=layer4_score or 0.0,
-            statistical_active=stat_active,
+            statistical_active=layer1_ran,
             lstm_ae_active=ae_active and layer2_score is not None,
             lstm_forecast_active=fc_active and layer3_score is not None,
             cnn_active=cnn_active and layer4_score is not None,

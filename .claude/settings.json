@@ -4,7 +4,9 @@
       "Bash(/c/Users/radze/meshteq-ai/primemodel-core/.venv/Scripts/uvicorn.exe app.main:app --reload --port 8000)",
       "Bash(curl -s http://127.0.0.1:8000/health)",
       "Bash(curl -s http://127.0.0.1:8000/docs)",
-      "Bash(kill %1)"
+      "Bash(kill %1)",
+      "Bash(/c/Users/radze/meshteq-ai/primemodel-core/.venv/Scripts/pip.exe install *)",
+      "Bash(/c/Users/radze/meshteq-ai/primemodel-core/.venv/Scripts/python.exe -c \"from supabase import create_client; print\\('supabase import OK'\\)\")"
     ]
   }
 }

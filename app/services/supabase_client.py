@@ -98,7 +98,7 @@ def fetch_uplink_history_legacy(
 
 def fetch_sensor_history(
     deveui: str,
-    limit: int = 500,
+    limit: int = 2000,
 ) -> List[Dict[str, Any]]:
     """
     Fetch recent uplink records for any LoRaWAN sensor from the lorawan_uplinks table.
@@ -116,17 +116,32 @@ def fetch_sensor_history(
     """
     try:
         client = _get_client()
-        response = (
-            client.table("lorawan_uplinks")
-            .select("deveui, decoded_payload, created_at")
-            .eq("deveui", deveui)
-            .order("created_at", desc=True)
-            .limit(limit)
-            .execute()
+        # Supabase PostgREST hard-caps single requests at 500 rows by default.
+        # We paginate in 500-row batches until we reach the limit or exhaust data.
+        all_rows: List[Dict[str, Any]] = []
+        page_size = 500
+        offset = 0
+        while len(all_rows) < limit:
+            batch_size = min(page_size, limit - len(all_rows))
+            response = (
+                client.table("lorawan_uplinks")
+                .select("deveui, decoded_payload, created_at")
+                .eq("deveui", deveui)
+                .order("created_at", desc=False)   # oldest first — no reversal needed
+                .range(offset, offset + batch_size - 1)
+                .execute()
+            )
+            batch = response.data or []
+            all_rows.extend(batch)
+            if len(batch) < batch_size:
+                break  # no more rows
+            offset += batch_size
+
+        logger.info(
+            "Sensor history fetched",
+            extra={"deveui": deveui, "rows": len(all_rows)},
         )
-        rows = response.data or []
-        # Return in chronological order (oldest first)
-        return list(reversed(rows))
+        return all_rows
     except Exception as e:
         logger.error(
             "Failed to fetch sensor history",

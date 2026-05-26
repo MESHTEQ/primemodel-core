@@ -2,7 +2,8 @@ fastapi
 uvicorn[standard]
 pydantic
 pydantic-settings
-supabase
+supabase==2.30.0
+storage3==0.7.7
 scikit-learn
 joblib
 pandas

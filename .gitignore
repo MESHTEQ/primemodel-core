@@ -20,12 +20,8 @@ build/
 venv/
 env/
 
-# Models store — large binary files, not for git
-models_store/baselines/
-models_store/*.pkl
-models_store/*.keras
-models_store/**/*.keras
-models_store/**/*.pkl
+# Models store — all trained model files, not for git
+models_store/
 
 # Database
 data/*.db
