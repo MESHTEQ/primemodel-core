@@ -8,12 +8,11 @@ statistical and neural models for all meters that have accumulated enough
 data and are past their retrain interval.
 
 Security note:
-    This endpoint should be protected in production. For now it is
-    open — add API key authentication before exposing to the internet.
-
-    TECHNICAL DEBT: TD-ADMIN-001 (MEDIUM)
-        Add bearer token / API key authentication to this endpoint.
-        Use a header: X-Admin-Key matching a env var ADMIN_API_KEY.
+    TD-ADMIN-001 — RESOLVED. Authentication is enforced router-wide via
+    app/utils/admin_auth.py (require_admin_key), applied as a router-level
+    dependency in app/main.py. Every request to /admin/* must carry a valid
+    X-Admin-Key header matching the ADMIN_API_KEY env var. FAIL-CLOSED:
+    if ADMIN_API_KEY is unset on the server, all /admin requests return 503.
 """
 
 from fastapi import APIRouter, BackgroundTasks

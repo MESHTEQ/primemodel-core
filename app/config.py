@@ -9,12 +9,22 @@ Never hardcode secrets — all sensitive values live in .env only.
 from pydantic_settings import BaseSettings
 from pydantic import Field
 from functools import lru_cache
+from typing import Optional
 
 
 class Settings(BaseSettings):
     # --- Supabase ---
     supabase_url: str = Field(..., description="Supabase project URL")
     supabase_service_key: str = Field(..., description="Supabase service-role key (never anon key)")
+
+    # --- Admin API ---
+    admin_api_key: Optional[str] = Field(
+        None,
+        description=(
+            "Static API key protecting the /admin router (X-Admin-Key header). "
+            "FAIL-CLOSED: if unset, all /admin endpoints return 503."
+        ),
+    )
 
     # --- App ---
     app_env: str = Field("development", description="production | development | test")

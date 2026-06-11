@@ -13,8 +13,9 @@ Routes:
     POST /admin/retrain      — trigger background model retraining
 """
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from app.routers import health, analyse, rul, models, admin
+from app.utils.admin_auth import require_admin_key
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -36,6 +37,8 @@ app.include_router(health.router, prefix="/health")
 app.include_router(analyse.router, prefix="/analyse")
 app.include_router(rul.router, prefix="/rul")
 app.include_router(models.router, prefix="/models")
-app.include_router(admin.router, prefix="/admin")
+# Router-level auth — every current and future /admin endpoint is protected
+# by the fail-closed X-Admin-Key check (resolves TD-ADMIN-001).
+app.include_router(admin.router, prefix="/admin", dependencies=[Depends(require_admin_key)])
 
 logger.info("PrimeModel AI Engine started")
