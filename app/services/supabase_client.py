@@ -104,7 +104,15 @@ def fetch_sensor_history(
     Fetch recent uplink records for any LoRaWAN sensor from the lorawan_uplinks table.
 
     This is the primary history fetch function for the sensor-agnostic /analyse endpoint.
-    Returns rows ordered chronologically (oldest first).
+    Returns the MOST RECENT `limit` rows, in chronological order (oldest first).
+
+    Prior bug (fixed 2026-06-12): the query ordered created_at ASCENDING and
+    paginated from offset 0, so once a device exceeded `limit` total rows every
+    call returned the FIRST `limit` uplinks ever recorded — a frozen historical
+    window (production symptom: identical ensemble scores across analyses,
+    readings_used pinned at the limit, days_of_data frozen). The query now walks
+    BACKWARDS from the newest row (descending) and reverses once at the end, so
+    the oldest-first return contract for all callers is unchanged.
 
     Args:
         deveui: Device EUI string — used to filter rows.
@@ -127,7 +135,7 @@ def fetch_sensor_history(
                 client.table("lorawan_uplinks")
                 .select("deveui, decoded_payload, created_at")
                 .eq("deveui", deveui)
-                .order("created_at", desc=False)   # oldest first — no reversal needed
+                .order("created_at", desc=True)   # newest first — walk backwards, reversed below
                 .range(offset, offset + batch_size - 1)
                 .execute()
             )
@@ -136,6 +144,10 @@ def fetch_sensor_history(
             if len(batch) < batch_size:
                 break  # no more rows
             offset += batch_size
+
+        # Collected newest-first; reverse once so the return contract stays
+        # chronological oldest-first for every caller (analyse, training).
+        all_rows.reverse()
 
         logger.info(
             "Sensor history fetched",
