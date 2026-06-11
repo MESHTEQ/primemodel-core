@@ -27,15 +27,22 @@ Implementation notes:
 
 import secrets
 
-from fastapi import Header, HTTPException
+from fastapi import HTTPException, Security
+from fastapi.security import APIKeyHeader
 
 from app.config import get_settings
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+# APIKeyHeader security scheme — registers the X-Admin-Key header with the
+# OpenAPI schema so Swagger UI (/docs) shows an Authorize button for it.
+# auto_error=False: missing header yields None and OUR handler returns the
+# 401 (preserving the exact P1 behaviour) instead of FastAPI's default 403.
+_admin_key_scheme = APIKeyHeader(name="X-Admin-Key", auto_error=False)
 
-def require_admin_key(x_admin_key: str = Header(None)) -> None:
+
+def require_admin_key(x_admin_key: str = Security(_admin_key_scheme)) -> None:
     """
     FastAPI dependency — validate the X-Admin-Key header for /admin routes.
 
