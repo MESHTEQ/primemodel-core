@@ -19,6 +19,7 @@ Cold-start: returns model_status="warming_up" and score=0.0 if not yet trained.
 """
 
 import os
+import json
 import numpy as np
 from typing import Optional, Tuple, Dict, Any
 
@@ -184,6 +185,73 @@ def load_model(model_store: str, meter_id: str) -> Optional["tf.keras.Model"]:
         return model
     except Exception as e:
         logger.error("Failed to load LSTM Autoencoder", extra={"path": path, "error": str(e)})
+        return None
+
+
+def save_threshold_stats(
+    stats: Dict[str, Any],
+    model_store: str,
+    model_key: str,
+) -> None:
+    """
+    Persist threshold stats to disk so the agnostic /analyse endpoint can load
+    calibrated values instead of the hardcoded fallback defaults.
+
+    Path: {model_store}/lstm_autoencoder/{safe_id}_stats.json
+    The same ``/`` and ``\\`` sanitisation used in ``save_model`` is applied
+    to ``model_key`` to derive ``safe_id``.
+
+    Args:
+        stats:       Dict with keys ``mae_mean``, ``mae_std``, ``threshold``
+                     (as returned by ``train``).
+        model_store: Root model store path (settings.model_store_path).
+        model_key:   Key string, e.g. ``"{deveui}_{param}"`` — same value
+                     used to save/load the Keras model.
+    """
+    safe_id = model_key.replace("/", "_").replace("\\", "_")
+    dir_path = os.path.join(model_store, "lstm_autoencoder")
+    os.makedirs(dir_path, exist_ok=True)
+    file_path = os.path.join(dir_path, f"{safe_id}_stats.json")
+    with open(file_path, "w", encoding="utf-8") as fh:
+        json.dump(stats, fh)
+    logger.info(
+        "LSTM AE threshold stats saved",
+        extra={"path": file_path, "model_key": model_key},
+    )
+
+
+def load_threshold_stats(
+    model_store: str,
+    model_key: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    Load persisted threshold stats for the given model key.
+
+    Returns ``None`` when the file is absent, unreadable, or contains invalid
+    JSON — a warning is logged in those cases.  Callers should fall back to
+    hardcoded defaults and log that calibration is missing.
+
+    These stats calibrate the agnostic /analyse scoring (Step 7).
+
+    Args:
+        model_store: Root model store path.
+        model_key:   Same key passed to ``save_threshold_stats``.
+
+    Returns:
+        Dict with ``mae_mean``, ``mae_std``, ``threshold``, or ``None``.
+    """
+    safe_id = model_key.replace("/", "_").replace("\\", "_")
+    file_path = os.path.join(model_store, "lstm_autoencoder", f"{safe_id}_stats.json")
+    if not os.path.exists(file_path):
+        return None
+    try:
+        with open(file_path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception as e:
+        logger.warning(
+            "Failed to load LSTM AE threshold stats",
+            extra={"path": file_path, "model_key": model_key, "error": str(e)},
+        )
         return None
 
 

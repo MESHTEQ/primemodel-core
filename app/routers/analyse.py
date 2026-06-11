@@ -318,7 +318,15 @@ def analyse(request: AnalyseRequest) -> AnalyseResponse:
                 ae_model_key = f"{deveui}_{primary_param}"
                 ae_model = lstm_autoencoder.load_model(settings.model_store_path, ae_model_key)
                 if ae_model is not None:
-                    ae_threshold_stats = {"mae_mean": 0.0, "mae_std": 1.0, "threshold": 1.0}
+                    loaded_stats = lstm_autoencoder.load_threshold_stats(settings.model_store_path, ae_model_key)
+                    if loaded_stats is not None:
+                        ae_threshold_stats = loaded_stats
+                    else:
+                        ae_threshold_stats = {"mae_mean": 0.0, "mae_std": 1.0, "threshold": 1.0}
+                        logger.warning(
+                            "LSTM AE scoring without calibrated threshold stats — results unreliable",
+                            extra={"model_key": ae_model_key},
+                        )
                     ae_score_val, _ = lstm_autoencoder.score(ae_model, sequence, ae_threshold_stats)
                     layer2_score = round(float(ae_score_val), 4)
         except Exception as e:
@@ -857,7 +865,7 @@ def _train_isolation_forest(history_df, settings, state, meter_id):
 def _train_lstm_autoencoder(history_df, settings, state, meter_id):
     """Train LSTM Autoencoder from uplink history and persist."""
     try:
-        sequences = _build_sequences_from_df(history_df)
+        sequences = feature_engineering.build_training_sequences(history_df)
         if sequences is None or len(sequences) < 10:
             return None
 
@@ -875,7 +883,7 @@ def _train_lstm_autoencoder(history_df, settings, state, meter_id):
 def _train_lstm_forecast(history_df, settings, state, meter_id):
     """Train LSTM Forecast model from uplink history and persist."""
     try:
-        sequences = _build_sequences_from_df(history_df)
+        sequences = feature_engineering.build_training_sequences(history_df)
         if sequences is None or len(sequences) < 10:
             return None
 
@@ -888,31 +896,6 @@ def _train_lstm_forecast(history_df, settings, state, meter_id):
     except Exception as e:
         logger.error("LSTM Forecast training failed", extra={"meter_id": meter_id, "error": str(e)})
         return None
-
-
-def _build_sequences_from_df(history_df, stride: int = 24) -> np.ndarray:
-    """
-    Slide a window of SEQUENCE_LENGTH over history_df to produce training sequences.
-    Stride controls overlap (smaller stride = more sequences but slower training).
-
-    Returns:
-        numpy array of shape (n_seqs, SEQUENCE_LENGTH, 4), or None if insufficient data.
-    """
-    seq_len = feature_engineering.SEQUENCE_LENGTH
-    if len(history_df) < seq_len + stride:
-        return None
-
-    all_seqs = []
-    for start in range(0, len(history_df) - seq_len, stride):
-        window = history_df.iloc[start: start + seq_len]
-        seq = feature_engineering.build_lstm_sequence(window, seq_len=seq_len)
-        if seq is not None:
-            all_seqs.append(seq)
-
-    if not all_seqs:
-        return None
-
-    return np.array(all_seqs)  # (n_seqs, seq_len, 4)
 
 
 def _build_explanation(

@@ -179,6 +179,49 @@ def build_lstm_sequence(
     return sequence  # shape: (seq_len, 4)
 
 
+def build_training_sequences(
+    history_df: pd.DataFrame,
+    stride: int = 24,
+) -> Optional[np.ndarray]:
+    """
+    Slide a window of SEQUENCE_LENGTH over ``history_df`` to produce training
+    sequences for LSTM models (autoencoder or forecast).
+
+    Stride controls overlap: a smaller stride produces more sequences but
+    increases training time.  The default of 24 (6 hours at 15-min cadence)
+    gives adequate coverage without redundancy.
+
+    Args:
+        history_df: DataFrame with "timestamp" and "flow_rate" columns,
+                    ordered chronologically.
+        stride:     Step size between consecutive windows (default 24).
+
+    Returns:
+        numpy array of shape (n_sequences, SEQUENCE_LENGTH, 4), or None if
+        the history is too short to produce even one sequence.
+
+    Note:
+        The threshold stats produced by training on these sequences are
+        persisted via ``lstm_autoencoder.save_threshold_stats`` /
+        ``load_threshold_stats`` to calibrate the agnostic /analyse scoring.
+    """
+    seq_len = SEQUENCE_LENGTH
+    if len(history_df) < seq_len + stride:
+        return None
+
+    all_seqs = []
+    for start in range(0, len(history_df) - seq_len, stride):
+        window = history_df.iloc[start: start + seq_len]
+        seq = build_lstm_sequence(window, seq_len=seq_len)
+        if seq is not None:
+            all_seqs.append(seq)
+
+    if not all_seqs:
+        return None
+
+    return np.array(all_seqs)  # shape: (n_sequences, seq_len, 4)
+
+
 def build_cnn_sequence(
     df: pd.DataFrame,
     ts_col: str = "timestamp",
