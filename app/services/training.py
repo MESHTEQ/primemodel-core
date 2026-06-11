@@ -11,10 +11,21 @@ Design rules:
 - TF stays lazy — this module must import cleanly on a TF-less machine.
 - Never raises — every outcome is captured in the return dict.
 - Training history is appended to a JSONL file for auditability.
+
+Lock registry (in-process threading.Lock):
+    Limitations accepted by Leo adjudication (2026-06-11):
+    (1) The lock is per-process — multi-worker deployments (e.g. uvicorn --workers N)
+        are NOT protected against concurrent training for the same device.  Railway
+        deploys a single-process container so this is acceptable for the current
+        deployment target.
+    (2) Crash recovery: a process crash clears all in-memory lock state.  The next
+        request will find the lock free and may re-queue training.  This is accepted
+        — the training function is idempotent and will simply re-train.
 """
 
 import json
 import os
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -29,6 +40,73 @@ from app.services.neural.lstm_autoencoder import save_threshold_stats
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# In-process training lock registry
+# ---------------------------------------------------------------------------
+
+# Set of deveui strings whose training job is currently running.
+_training_locks: set = set()
+# Guards all mutations of _training_locks — acquired briefly, never during I/O.
+_registry_lock = threading.Lock()
+
+
+def try_acquire_training_lock(deveui: str) -> bool:
+    """
+    Attempt to mark a device as currently training.
+
+    Returns True and adds the deveui to the active set if it was not already
+    present.  Returns False (without modifying the set) if training is already
+    in progress for this device.
+
+    Thread-safe within a single process.  See module docstring for multi-worker
+    limitations.
+    """
+    with _registry_lock:
+        if deveui in _training_locks:
+            return False
+        _training_locks.add(deveui)
+        return True
+
+
+def release_training_lock(deveui: str) -> None:
+    """
+    Remove the device from the active training set.
+
+    Idempotent — calling this when the deveui is not locked is a no-op.
+    Used in a ``finally`` block by ``run_training_job`` so that a crashed
+    training run never permanently wedges the lock.
+    """
+    with _registry_lock:
+        _training_locks.discard(deveui)
+
+
+def is_training(deveui: str) -> bool:
+    """Return True if a training job is currently active for this device."""
+    with _registry_lock:
+        return deveui in _training_locks
+
+
+def run_training_job(deveui: str, param: Optional[str] = None) -> None:
+    """
+    Execute a training job and release the lock when done.
+
+    The CALLER is responsible for acquiring the lock via
+    ``try_acquire_training_lock`` before scheduling this task.
+    This function releases the lock in a ``finally`` block so that a crashed
+    or erroring training run never permanently wedges the lock.
+
+    Args:
+        deveui: Device EUI (already normalised to uppercase by the caller).
+        param:  Optional parameter name to train on.
+    """
+    logger.info("Training job started", extra={"deveui": deveui, "param": param})
+    try:
+        train_lstm_ae_for_device(deveui, param)
+    finally:
+        release_training_lock(deveui)
+        logger.info("Training job finished, lock released", extra={"deveui": deveui})
 
 
 # ---------------------------------------------------------------------------

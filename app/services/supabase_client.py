@@ -150,6 +150,65 @@ def fetch_sensor_history(
         return []
 
 
+def fetch_analysis_results(
+    deveui: str,
+    limit: int = 20,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch recent analysis results for a device from the analysis_results table.
+
+    Returns the most recent rows (newest first), selecting only the 10 columns
+    needed by the admin scores endpoint.  This avoids pulling large jsonb blobs
+    that are not required for the scores view.
+
+    Schema verified read-only via Supabase MCP (2026-06-11) against project
+    pkloaajhalichjopzlob.  Columns confirmed present: created_at, ensemble_score,
+    layer1_scores, layer2_score, layer3_score, layer4_score, active_layers,
+    anomaly_detected, readings_used, days_of_data.
+
+    Args:
+        deveui: Device EUI string (uppercase hex, no underscores).
+        limit:  Maximum number of rows to return (default 20).
+
+    Returns:
+        List of dicts with the 10 selected columns, ordered newest first.
+        Returns empty list on error or no data.
+    """
+    try:
+        client = _get_client()
+        response = (
+            client.table("analysis_results")
+            .select(
+                "created_at,"
+                "ensemble_score,"
+                "layer1_scores,"
+                "layer2_score,"
+                "layer3_score,"
+                "layer4_score,"
+                "active_layers,"
+                "anomaly_detected,"
+                "readings_used,"
+                "days_of_data"
+            )
+            .eq("deveui", deveui)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        rows = response.data or []
+        logger.info(
+            "Analysis results fetched",
+            extra={"deveui": deveui, "rows": len(rows)},
+        )
+        return rows
+    except Exception as e:
+        logger.error(
+            "Failed to fetch analysis results",
+            extra={"deveui": deveui, "error": str(e)},
+        )
+        return []
+
+
 def write_analysis_result(
     deveui: str,
     result: dict,
