@@ -327,10 +327,10 @@ class TestEndToEndTraining:
         assert "threshold_stats" in result
         assert result["threshold_stats"]["threshold"] > 0.0
 
-        # Model directory must exist
+        # Model file must exist (.keras single-file format)
         safe_id = f"{_FAKE_DEVEUI}_flow_rate".replace("/", "_").replace("\\", "_")
-        model_dir = tmp_path / "lstm_autoencoder" / safe_id
-        assert model_dir.exists(), f"Model dir missing: {model_dir}"
+        model_file = tmp_path / "lstm_autoencoder" / f"{safe_id}.keras"
+        assert model_file.exists(), f"Model file missing: {model_file}"
 
         # Stats file must exist
         stats_file = tmp_path / "lstm_autoencoder" / f"{safe_id}_stats.json"

@@ -163,11 +163,14 @@ def train(
 
 def save_model(model: "tf.keras.Model", model_store: str, meter_id: str) -> str:
     """
-    Save the LSTM Forecast model using TensorFlow SavedModel format.
+    Save the LSTM Forecast model using the Keras 3 single-file format.
+
+    The model is written as a single ``{safe_id}.keras`` file inside
+    ``{model_store}/lstm_forecast/``.
     """
     safe_id = meter_id.replace("/", "_").replace("\\", "_")
-    path = os.path.join(model_store, "lstm_forecast", safe_id)
-    os.makedirs(path, exist_ok=True)
+    path = os.path.join(model_store, "lstm_forecast", f"{safe_id}.keras")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     model.save(path)
     logger.info("LSTM Forecast saved", extra={"path": path, "meter_id": meter_id})
     return path
@@ -175,13 +178,13 @@ def save_model(model: "tf.keras.Model", model_store: str, meter_id: str) -> str:
 
 def load_model(model_store: str, meter_id: str) -> Optional["tf.keras.Model"]:
     """
-    Load a persisted LSTM Forecast model.
-    Returns None if no model exists.
+    Load a persisted LSTM Forecast model from a ``.keras`` single-file.
+    Returns None if no ``.keras`` file exists.
     """
     tf = _get_tf()
     safe_id = meter_id.replace("/", "_").replace("\\", "_")
-    path = os.path.join(model_store, "lstm_forecast", safe_id)
-    if not os.path.exists(path):
+    path = os.path.join(model_store, "lstm_forecast", f"{safe_id}.keras")
+    if not os.path.isfile(path):
         return None
     try:
         model = tf.keras.models.load_model(path)

@@ -149,7 +149,10 @@ def save_model(
     meter_id: str,
 ) -> str:
     """
-    Save the LSTM Autoencoder model to disk using TensorFlow SavedModel format.
+    Save the LSTM Autoencoder model to disk using the Keras 3 single-file format.
+
+    The model is written as a single ``{safe_id}.keras`` file inside
+    ``{model_store}/lstm_autoencoder/``.
 
     Args:
         model: Trained Keras model.
@@ -157,11 +160,11 @@ def save_model(
         meter_id: Meter identifier.
 
     Returns:
-        Directory path where the model was saved.
+        Full path to the saved ``.keras`` file.
     """
     safe_id = meter_id.replace("/", "_").replace("\\", "_")
-    path = os.path.join(model_store, "lstm_autoencoder", safe_id)
-    os.makedirs(path, exist_ok=True)
+    path = os.path.join(model_store, "lstm_autoencoder", f"{safe_id}.keras")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     model.save(path)
     logger.info("LSTM Autoencoder saved", extra={"path": path, "meter_id": meter_id})
     return path
@@ -169,15 +172,15 @@ def save_model(
 
 def load_model(model_store: str, meter_id: str) -> Optional["tf.keras.Model"]:
     """
-    Load a persisted LSTM Autoencoder model.
+    Load a persisted LSTM Autoencoder model from a ``.keras`` single-file.
 
     Returns:
-        Loaded Keras model, or None if no saved model exists.
+        Loaded Keras model, or None if no saved ``.keras`` file exists.
     """
     tf, keras = _get_tf()
     safe_id = meter_id.replace("/", "_").replace("\\", "_")
-    path = os.path.join(model_store, "lstm_autoencoder", safe_id)
-    if not os.path.exists(path):
+    path = os.path.join(model_store, "lstm_autoencoder", f"{safe_id}.keras")
+    if not os.path.isfile(path):
         return None
     try:
         model = tf.keras.models.load_model(path)

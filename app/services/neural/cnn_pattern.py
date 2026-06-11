@@ -142,13 +142,16 @@ def train(
 
 def save_model(model: "tf.keras.Model", model_store: str, zone_id: str) -> str:
     """
-    Save the CNN model using TensorFlow SavedModel format.
+    Save the CNN model using the Keras 3 single-file format.
+
+    The model is written as a single ``{safe_id}.keras`` file inside
+    ``{model_store}/cnn_pattern/``.
 
     Note: scope is zone_id, not meter_id.
     """
     safe_id = zone_id.replace("/", "_").replace("\\", "_")
-    path = os.path.join(model_store, "cnn_pattern", safe_id)
-    os.makedirs(path, exist_ok=True)
+    path = os.path.join(model_store, "cnn_pattern", f"{safe_id}.keras")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     model.save(path)
     logger.info("CNN Pattern saved", extra={"path": path, "zone_id": zone_id})
     return path
@@ -156,13 +159,13 @@ def save_model(model: "tf.keras.Model", model_store: str, zone_id: str) -> str:
 
 def load_model(model_store: str, zone_id: str) -> Optional["tf.keras.Model"]:
     """
-    Load a persisted CNN Pattern model.
-    Returns None if no model exists.
+    Load a persisted CNN Pattern model from a ``.keras`` single-file.
+    Returns None if no ``.keras`` file exists.
     """
     tf = _get_tf()
     safe_id = zone_id.replace("/", "_").replace("\\", "_")
-    path = os.path.join(model_store, "cnn_pattern", safe_id)
-    if not os.path.exists(path):
+    path = os.path.join(model_store, "cnn_pattern", f"{safe_id}.keras")
+    if not os.path.isfile(path):
         return None
     try:
         model = tf.keras.models.load_model(path)
