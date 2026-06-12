@@ -22,7 +22,7 @@ Design principles (both endpoints):
 
 import numpy as np
 import pandas as pd
-from typing import Optional
+from typing import Dict, Optional
 from fastapi import APIRouter, HTTPException
 from datetime import datetime, timezone
 
@@ -304,33 +304,39 @@ def analyse(request: AnalyseRequest) -> AnalyseResponse:
         active_layers.insert(0, "statistical")
 
     # ------------------------------------------------------------------
-    # Step 7: Layer 2 — LSTM Autoencoder
-    # Uses the first available parameter as primary time series
+    # Step 7: Layer 2 — LSTM Autoencoder (multi-parameter)
+    # Scores every parameter that has a trained model artifact.
+    # layer2_scores: per-param dict. layer2_score: MAX across params (worst-case).
+    # Silent skip if no model exists for a param — no log, no entry in dict.
     # ------------------------------------------------------------------
-    layer2_score: Optional[float] = None
+    layer2_scores: Dict[str, float] = {}
     if ae_active and parameters_analysed:
-        try:
-            primary_param = parameters_analysed[0]
-            primary_values = [v for (_, v) in param_series[primary_param]]
-            primary_df = pd.DataFrame({"timestamp": [ts for (ts, _) in param_series[primary_param]], "flow_rate": primary_values})
-            sequence = feature_engineering.build_lstm_sequence(primary_df)
-            if sequence is not None:
-                ae_model_key = f"{deveui}_{primary_param}"
+        for param in parameters_analysed:
+            try:
+                ae_model_key = f"{deveui}_{param}"
                 ae_model = lstm_autoencoder.load_model(settings.model_store_path, ae_model_key)
-                if ae_model is not None:
-                    loaded_stats = lstm_autoencoder.load_threshold_stats(settings.model_store_path, ae_model_key)
-                    if loaded_stats is not None:
-                        ae_threshold_stats = loaded_stats
-                    else:
-                        ae_threshold_stats = {"mae_mean": 0.0, "mae_std": 1.0, "threshold": 1.0}
-                        logger.warning(
-                            "LSTM AE scoring without calibrated threshold stats — results unreliable",
-                            extra={"model_key": ae_model_key},
-                        )
-                    ae_score_val, _ = lstm_autoencoder.score(ae_model, sequence, ae_threshold_stats)
-                    layer2_score = round(float(ae_score_val), 4)
-        except Exception as e:
-            logger.warning("LSTM AE scoring failed", extra={"deveui": deveui, "error": str(e)})
+                if ae_model is None:
+                    continue
+                param_values = [v for (_, v) in param_series[param]]
+                param_df = pd.DataFrame({"timestamp": [ts for (ts, _) in param_series[param]], "flow_rate": param_values})
+                sequence = feature_engineering.build_lstm_sequence(param_df)
+                if sequence is None:
+                    continue
+                ae_stats = lstm_autoencoder.load_threshold_stats(settings.model_store_path, ae_model_key)
+                if ae_stats is not None:
+                    ae_threshold_stats = ae_stats
+                else:
+                    ae_threshold_stats = {"mae_mean": 0.0, "mae_std": 1.0, "threshold": 1.0}
+                    logger.warning(
+                        "LSTM AE scoring without calibrated threshold stats — results unreliable",
+                        extra={"model_key": ae_model_key},
+                    )
+                ae_score_val, _ = lstm_autoencoder.score(ae_model, sequence, ae_threshold_stats)
+                layer2_scores[param] = round(float(ae_score_val), 4)
+            except Exception as e:
+                logger.warning("LSTM AE scoring failed", extra={"deveui": deveui, "param": param, "error": str(e)})
+
+    layer2_score: Optional[float] = max(layer2_scores.values()) if layer2_scores else None
 
     # ------------------------------------------------------------------
     # Step 8: Layer 3 — LSTM Forecast
@@ -408,6 +414,7 @@ def analyse(request: AnalyseRequest) -> AnalyseResponse:
         days_of_data=round(days_of_data, 2),
         layer1_scores=layer1_scores,
         layer2_score=layer2_score,
+        layer2_scores=layer2_scores,
         layer3_score=layer3_score,
         layer4_score=layer4_score,
         ensemble_score=ensemble_score,

@@ -90,6 +90,10 @@ class AnalyseResponse(BaseModel):
         le=1.0,
         description="LSTM Autoencoder anomaly score [0, 1]. Null if layer not yet active (requires 30 days of data).",
     )
+    layer2_scores: Dict[str, float] = Field(
+        default_factory=dict,
+        description="LSTM Autoencoder anomaly score per parameter (keys = param names, values [0, 1]). Empty if layer not active or no models exist."
+    )
     layer3_score: Optional[float] = Field(
         None,
         ge=0.0,
@@ -142,6 +146,7 @@ class AnalyseResponse(BaseModel):
                 "days_of_data": 14.3,
                 "layer1_scores": {"temperature": 0.12, "humidity": 0.08},
                 "layer2_score": None,
+                "layer2_scores": {},
                 "layer3_score": None,
                 "layer4_score": None,
                 "ensemble_score": 0.10,
