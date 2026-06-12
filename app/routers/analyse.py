@@ -129,6 +129,9 @@ def analyse(request: AnalyseRequest) -> AnalyseResponse:
                 param_series[param] = []
             param_series[param].append((created_at, value))
 
+    # Strip system/health keys so all layers see a clean channel list
+    param_series = {k: v for k, v in param_series.items() if k.lower() not in _SYSTEM_KEYS}
+
     parameters_analysed = [
         p for p in param_series.keys()
         if p.lower() not in _SYSTEM_KEYS
@@ -224,35 +227,78 @@ def analyse(request: AnalyseRequest) -> AnalyseResponse:
                     rolling_std_1h=rolling_std,
                 )
                 model_key = f"{deveui}_{param}"
-                if_model = isolation_forest.load_model(settings.model_store_path, model_key)
-                if if_model is None:
-                    # Train on full history and score in the same request
-                    flows = np.array(values, dtype=float)
-                    deltas = np.concatenate([[0.0], np.diff(flows)])
-                    hours_arr = pd.to_datetime(
-                        [ts for (ts, _) in series], utc=True, errors="coerce"
-                    ).hour + pd.to_datetime(
-                        [ts for (ts, _) in series], utc=True, errors="coerce"
-                    ).minute / 60.0
-                    dows_arr = pd.to_datetime(
-                        [ts for (ts, _) in series], utc=True, errors="coerce"
-                    ).dayofweek
-                    X = np.column_stack([
-                        flows,
-                        deltas,
-                        hours_arr.to_numpy(dtype=float),
-                        dows_arr.to_numpy(dtype=float),
-                        pd.Series(flows).rolling(4, min_periods=1).mean().values,
-                        pd.Series(flows).rolling(4, min_periods=1).std().fillna(0).values,
-                    ])
-                    if_model, calibration_stats = isolation_forest.train(X, contamination=settings.isolation_forest_contamination)
-                    isolation_forest.save_model(if_model, settings.model_store_path, model_key)
-                    isolation_forest.save_calibration_stats(settings.model_store_path, model_key, calibration_stats)
-                    logger.info("IF trained and scoring in same request", extra={"deveui": deveui, "param": param, "n": len(values)})
 
-                # Score immediately — whether freshly trained or loaded from disk
-                if_calibration_stats = isolation_forest.load_calibration_stats(settings.model_store_path, model_key)
-                if_score, is_if_anomaly = isolation_forest.score(if_model, feat_vec, if_calibration_stats)
+                # Pre-compute training matrix X — used in both fresh-train and self-heal
+                # paths below. Building it here avoids repetition; it is cheap (in memory).
+                _flows = np.array(values, dtype=float)
+                _deltas = np.concatenate([[0.0], np.diff(_flows)])
+                _ts_index = pd.to_datetime(
+                    [ts for (ts, _) in series], utc=True, errors="coerce"
+                )
+                _hours_arr = _ts_index.hour + _ts_index.minute / 60.0
+                _dows_arr = _ts_index.dayofweek
+                X = np.column_stack([
+                    _flows,
+                    _deltas,
+                    _hours_arr.to_numpy(dtype=float),
+                    _dows_arr.to_numpy(dtype=float),
+                    pd.Series(_flows).rolling(4, min_periods=1).mean().values,
+                    pd.Series(_flows).rolling(4, min_periods=1).std().fillna(0).values,
+                ])
+
+                if_model = isolation_forest.load_model(settings.model_store_path, model_key)
+                if_calibration_stats = None
+
+                if if_model is None:
+                    # Fresh train — model and stats are both produced here
+                    if_model, if_calibration_stats = isolation_forest.train(
+                        X, contamination=settings.isolation_forest_contamination
+                    )
+                    isolation_forest.save_model(if_model, settings.model_store_path, model_key)
+                    isolation_forest.save_calibration_stats(
+                        settings.model_store_path, model_key, if_calibration_stats
+                    )
+                    logger.info(
+                        "IF trained and scoring in same request",
+                        extra={"deveui": deveui, "param": param, "n": len(values)},
+                    )
+                else:
+                    # Model exists — load calibration stats
+                    if_calibration_stats = isolation_forest.load_calibration_stats(
+                        settings.model_store_path, model_key
+                    )
+                    if if_calibration_stats is None:
+                        # Self-heal: model artifact present but calibration stats file is
+                        # absent (e.g. stats lost after volume migration or partial write).
+                        # Retrain in-request to regenerate stats; replace the model artifact
+                        # as well so both files are consistent.
+                        logger.info(
+                            "[L1 self-heal] calibration stats missing for %s — retraining in-request",
+                            model_key,
+                        )
+                        try:
+                            if_model, if_calibration_stats = isolation_forest.train(
+                                X, contamination=settings.isolation_forest_contamination
+                            )
+                            isolation_forest.save_model(
+                                if_model, settings.model_store_path, model_key
+                            )
+                            isolation_forest.save_calibration_stats(
+                                settings.model_store_path, model_key, if_calibration_stats
+                            )
+                        except Exception as heal_err:
+                            logger.warning(
+                                "[L1 self-heal] retrain failed for %s: %s — using legacy sigmoid",
+                                model_key,
+                                heal_err,
+                            )
+                            if_calibration_stats = None  # explicit — legacy fallback fires in score()
+
+                # Score — if_calibration_stats may be None here only when self-heal failed;
+                # isolation_forest.score() handles None via its legacy sigmoid fallback.
+                if_score, is_if_anomaly = isolation_forest.score(
+                    if_model, feat_vec, if_calibration_stats
+                )
                 param_score = max(param_score, if_score)
                 layer1_ran = True
                 if is_if_anomaly:
