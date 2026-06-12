@@ -8,6 +8,7 @@ Unit tests for all four statistical layer components:
 - Burst detector
 """
 
+import math
 import numpy as np
 import pytest
 import tempfile
@@ -45,48 +46,128 @@ def _make_normal_features(n: int = 300) -> np.ndarray:
 class TestIsolationForest:
     def test_train_returns_model(self):
         X = _make_normal_features()
-        model = isolation_forest.train(X)
+        model, stats = isolation_forest.train(X)
         assert model is not None
+        assert "center" in stats
+        assert "scale" in stats
 
     def test_score_normal_is_low(self):
         X = _make_normal_features()
-        model = isolation_forest.train(X)
+        model, stats = isolation_forest.train(X)
         # Score multiple normal samples and check the mean is < 0.6
-        scores = [isolation_forest.score(model, X[i])[0] for i in range(10)]
+        scores = [isolation_forest.score(model, X[i], stats)[0] for i in range(10)]
         assert 0.0 <= min(scores)
         assert max(scores) <= 1.0
         assert sum(scores) / len(scores) < 0.6, f"Mean normal score too high: {sum(scores)/len(scores):.3f}"
 
     def test_anomaly_sample_scores_higher(self):
         X = _make_normal_features()
-        model = isolation_forest.train(X)
+        model, stats = isolation_forest.train(X)
         # Mean score of 10 normal samples
-        normal_scores = [isolation_forest.score(model, X[i])[0] for i in range(10)]
+        normal_scores = [isolation_forest.score(model, X[i], stats)[0] for i in range(10)]
         mean_normal_score = sum(normal_scores) / len(normal_scores)
 
         # Inject extreme outlier — flow 50x higher than normal, extreme delta
         anomaly = np.array([50.0, 49.5, 3.0, 1.0, 50.0, 20.0], dtype=np.float32)
-        anomaly_score, _ = isolation_forest.score(model, anomaly)
+        anomaly_score, _ = isolation_forest.score(model, anomaly, stats)
         # The anomaly should score higher than the mean of normals
         assert anomaly_score > mean_normal_score, \
             f"Anomaly score {anomaly_score:.3f} should exceed mean normal {mean_normal_score:.3f}"
 
     def test_save_and_load(self):
         X = _make_normal_features()
-        model = isolation_forest.train(X)
+        model, stats = isolation_forest.train(X)
         with tempfile.TemporaryDirectory() as tmpdir:
             os.makedirs(os.path.join(tmpdir, "isolation_forest"))
             isolation_forest.save_model(model, tmpdir, "test_meter")
             loaded = isolation_forest.load_model(tmpdir, "test_meter")
             assert loaded is not None
-            score1, _ = isolation_forest.score(model, X[0])
-            score2, _ = isolation_forest.score(loaded, X[0])
+            score1, _ = isolation_forest.score(model, X[0], stats)
+            score2, _ = isolation_forest.score(loaded, X[0], stats)
             assert score1 == pytest.approx(score2, abs=1e-4)
 
     def test_load_nonexistent_returns_none(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             result = isolation_forest.load_model(tmpdir, "nonexistent")
             assert result is None
+
+    def test_score_with_calibration_stats_z0(self):
+        """z=0 should score ~0.047"""
+        # center=0, scale=1, raw_score=0 → z = (0 - 0) / 1 = 0 → score = sigmoid(0 - 3) ≈ 0.047
+        stats = {"center": 0.0, "scale": 1.0}
+
+        class MockModel:
+            def decision_function(self, X):
+                return np.array([0.0])
+
+            def predict(self, X):
+                return np.array([1])
+
+        score_val, _ = isolation_forest.score(MockModel(), [0.0], calibration_stats=stats)
+        assert abs(score_val - (1 / (1 + math.exp(3)))) < 0.001  # ~0.047
+
+    def test_score_with_calibration_stats_z3(self):
+        """z=3 should score ~0.5"""
+        # center=3, scale=1, raw_score=0 → z = (3 - 0) / 1 = 3 → score = sigmoid(0) = 0.5
+        stats = {"center": 3.0, "scale": 1.0}
+
+        class MockModel:
+            def decision_function(self, X):
+                return np.array([0.0])
+
+            def predict(self, X):
+                return np.array([1])
+
+        score_val, _ = isolation_forest.score(MockModel(), [0.0], calibration_stats=stats)
+        assert abs(score_val - 0.5) < 0.01
+
+    def test_score_with_calibration_stats_z6(self):
+        """z=6 should score ~0.952"""
+        # center=6, scale=1, raw_score=0 → z = (6 - 0) / 1 = 6 → score = sigmoid(3) ≈ 0.952
+        stats = {"center": 6.0, "scale": 1.0}
+
+        class MockModel:
+            def decision_function(self, X):
+                return np.array([0.0])
+
+            def predict(self, X):
+                return np.array([1])
+
+        score_val, _ = isolation_forest.score(MockModel(), [0.0], calibration_stats=stats)
+        assert abs(score_val - (1 / (1 + math.exp(-3)))) < 0.001  # ~0.952
+
+    def test_score_without_calibration_stats_uses_legacy(self):
+        """stats=None should use legacy sigmoid path without error"""
+
+        class MockModel:
+            def decision_function(self, X):
+                return np.array([-0.1])
+
+            def predict(self, X):
+                return np.array([-1])
+
+        score_val, is_anomaly = isolation_forest.score(MockModel(), [0.0], calibration_stats=None)
+        assert 0.0 <= score_val <= 1.0
+        assert is_anomaly is True
+
+    def test_calibration_stats_mad_zero_fallback(self, tmp_path):
+        """MAD=0 (all same values) should fall back to std, then 1.0 — scale must remain > 0"""
+        # All-identical rows → decision_function returns identical scores → MAD=0
+        X = np.ones((20, 1))
+        model, stats = isolation_forest.train(X)
+        assert stats["scale"] > 0  # fallback to std or 1.0 must prevent zero scale
+
+    def test_save_load_calibration_stats(self, tmp_path):
+        stats_in = {"center": 0.123, "scale": 0.456}
+        isolation_forest.save_calibration_stats(str(tmp_path), "test_meter", stats_in)
+        stats_out = isolation_forest.load_calibration_stats(str(tmp_path), "test_meter")
+        assert stats_out is not None
+        assert abs(stats_out["center"] - 0.123) < 1e-9
+        assert abs(stats_out["scale"] - 0.456) < 1e-9
+
+    def test_load_calibration_stats_missing_returns_none(self, tmp_path):
+        result = isolation_forest.load_calibration_stats(str(tmp_path), "no_such_meter")
+        assert result is None
 
 
 # ---------------------------------------------------------------------------

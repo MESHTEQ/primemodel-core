@@ -283,8 +283,13 @@ def score(
     mae_mean = threshold_stats.get("mae_mean", 0.0)
     mae_std = threshold_stats.get("mae_std", 1.0)
 
-    # Normalise against the threshold
-    normalised = float(np.clip(mae / (threshold + 1e-9), 0.0, 2.0) / 2.0)
+    # Z-score squash using per-model calibration stats
+    if mae_std > 0:
+        z = (mae - mae_mean) / mae_std
+        normalised = float(np.clip(1.0 / (1.0 + np.exp(-(z - 3.0))), 0.0, 1.0))
+    else:
+        logger.warning("mae_std is 0 or missing — falling back to legacy MAE/threshold normalisation")
+        normalised = float(np.clip(mae / (threshold + 1e-9), 0.0, 2.0) / 2.0)
     is_anomaly = mae > threshold
 
     return normalised, is_anomaly

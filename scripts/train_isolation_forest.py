@@ -63,16 +63,18 @@ def main():
     print(f"  Feature matrix shape: {X.shape}")
 
     print("Training Isolation Forest...")
-    model = isolation_forest.train(X, contamination=args.contamination)
+    model, calibration_stats = isolation_forest.train(X, contamination=args.contamination)
 
     path = isolation_forest.save_model(model, args.model_store, args.meter_id)
+    isolation_forest.save_calibration_stats(args.model_store, args.meter_id, calibration_stats)
     print(f"Model saved to: {path}")
+    print(f"Calibration stats: center={calibration_stats['center']:.6f}, scale={calibration_stats['scale']:.6f}")
 
     # Quick evaluation on labelled data
     if "label_type" in df.columns:
         scores = []
         for i in range(len(X)):
-            s, _ = isolation_forest.score(model, X[i])
+            s, _ = isolation_forest.score(model, X[i], calibration_stats)
             scores.append(s)
         df["anomaly_score"] = scores
         print("\nMean anomaly scores by label:")

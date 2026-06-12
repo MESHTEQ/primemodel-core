@@ -27,7 +27,8 @@ except ImportError:
 pytestmark = pytest.mark.skipif(not TF_AVAILABLE, reason="TensorFlow not installed")
 
 
-from app.services.neural.lstm_autoencoder import build_model, train, save_model, load_model, score
+import math
+from app.services.neural.lstm_autoencoder import build_model, train, save_model, load_model, score, save_threshold_stats, load_threshold_stats
 
 
 SEQ_LEN = 32   # Shortened for test speed
@@ -124,3 +125,68 @@ class TestLSTMAutoencoderPersistence:
     def test_load_missing_returns_none(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             assert load_model(tmpdir, "nonexistent") is None
+
+    def test_save_load_threshold_stats_roundtrip(self, tmp_path):
+        """save/load threshold stats preserves all values exactly."""
+        stats_in = {"mae_mean": 0.05, "mae_std": 0.01, "threshold": 0.08}
+        save_threshold_stats(stats_in, str(tmp_path), "test_key")
+        stats_out = load_threshold_stats(str(tmp_path), "test_key")
+        assert stats_out is not None
+        assert abs(stats_out["mae_mean"] - 0.05) < 1e-9
+        assert abs(stats_out["mae_std"] - 0.01) < 1e-9
+        assert abs(stats_out["threshold"] - 0.08) < 1e-9
+
+    def test_load_threshold_stats_missing_returns_none(self, tmp_path):
+        assert load_threshold_stats(str(tmp_path), "no_such_key") is None
+
+
+class TestLSTMAutoencoderScoreCalibration:
+    """Tests for the L2 z-score squash normalisation introduced in P10."""
+
+    def test_score_z_squash_z3(self):
+        """mae == mae_mean + 3*mae_std → z=3 → score ≈ 0.5"""
+        # score() requires a real Keras model (calls model.predict).
+        # We build and compile a minimal model, then craft threshold_stats so
+        # that the MAE the model produces maps to z=3.
+        # Strategy: train a tiny model on one sequence type, check that the
+        # normalised output lies in [0,1] and that the z-score formula is applied.
+        sequences = _make_sequences(n=40)
+        model, stats = train(
+            sequences,
+            seq_len=SEQ_LEN,
+            n_features=N_FEATURES,
+            epochs=1,
+            batch_size=8,
+        )
+        # Inject synthetic stats that force z=3 for this model's actual MAE
+        # on sequences[0], so score ≈ 0.5.
+        x = sequences[0][np.newaxis, ...]
+        reconstruction = model.predict(x, verbose=0)
+        actual_mae = float(np.mean(np.abs(x - reconstruction)))
+        # Choose mae_mean and mae_std so that z = (actual_mae - mae_mean) / mae_std = 3
+        mae_std_val = max(actual_mae / 4.0, 1e-6)  # arbitrary non-zero std
+        mae_mean_val = actual_mae - 3.0 * mae_std_val
+        synth_stats = {
+            "threshold": actual_mae * 2.0,  # above actual → is_anomaly=False
+            "mae_mean": mae_mean_val,
+            "mae_std": mae_std_val,
+        }
+        scored, _ = score(model, sequences[0], synth_stats)
+        # z=3 → sigmoid(0) = 0.5
+        assert abs(scored - 0.5) < 0.05, f"Expected ~0.5 for z=3, got {scored:.4f}"
+
+    def test_score_mae_std_zero_fallback(self):
+        """mae_std=0 should fall back to legacy normalisation without raising."""
+        sequences = _make_sequences(n=40)
+        model, _ = train(
+            sequences,
+            seq_len=SEQ_LEN,
+            n_features=N_FEATURES,
+            epochs=1,
+            batch_size=8,
+        )
+        # mae_std=0 forces the fallback path
+        fallback_stats = {"threshold": 0.5, "mae_mean": 0.0, "mae_std": 0.0}
+        scored, is_anom = score(model, sequences[0], fallback_stats)
+        assert 0.0 <= scored <= 1.0
+        assert isinstance(is_anom, bool)

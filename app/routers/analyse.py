@@ -60,6 +60,13 @@ from app.services.decoder_bove import decode as decode_bove
 logger = get_logger(__name__)
 router = APIRouter()
 
+# Parameters that represent radio/hardware telemetry and must never be scored
+# as sensor physics. Matched case-insensitively against decoded payload keys.
+_SYSTEM_KEYS = {
+    "battery", "battery_level", "batt", "bat",
+    "rssi", "signal", "snr", "fport", "fcnt",
+}
+
 
 # ===========================================================================
 # NEW — Sensor-agnostic POST /analyse
@@ -122,7 +129,10 @@ def analyse(request: AnalyseRequest) -> AnalyseResponse:
                 param_series[param] = []
             param_series[param].append((created_at, value))
 
-    parameters_analysed = list(param_series.keys())
+    parameters_analysed = [
+        p for p in param_series.keys()
+        if p.lower() not in _SYSTEM_KEYS
+    ]
     readings_used = len(rows)
 
     # ------------------------------------------------------------------
@@ -235,12 +245,14 @@ def analyse(request: AnalyseRequest) -> AnalyseResponse:
                         pd.Series(flows).rolling(4, min_periods=1).mean().values,
                         pd.Series(flows).rolling(4, min_periods=1).std().fillna(0).values,
                     ])
-                    if_model = isolation_forest.train(X, contamination=settings.isolation_forest_contamination)
+                    if_model, calibration_stats = isolation_forest.train(X, contamination=settings.isolation_forest_contamination)
                     isolation_forest.save_model(if_model, settings.model_store_path, model_key)
+                    isolation_forest.save_calibration_stats(settings.model_store_path, model_key, calibration_stats)
                     logger.info("IF trained and scoring in same request", extra={"deveui": deveui, "param": param, "n": len(values)})
 
                 # Score immediately — whether freshly trained or loaded from disk
-                if_score, is_if_anomaly = isolation_forest.score(if_model, feat_vec)
+                if_calibration_stats = isolation_forest.load_calibration_stats(settings.model_store_path, model_key)
+                if_score, is_if_anomaly = isolation_forest.score(if_model, feat_vec, if_calibration_stats)
                 param_score = max(param_score, if_score)
                 layer1_ran = True
                 if is_if_anomaly:
@@ -559,7 +571,8 @@ def analyse_legacy(request: LegacyAnalyseRequest) -> LegacyAnalyseResponse:
 
         if if_model is not None:
             try:
-                if_score, is_if_anomaly = isolation_forest.score(if_model, feat_vec)
+                if_calibration_stats = isolation_forest.load_calibration_stats(settings.model_store_path, meter_id)
+                if_score, is_if_anomaly = isolation_forest.score(if_model, feat_vec, if_calibration_stats)
             except Exception as e:
                 logger.warning("IF scoring failed", extra={"meter_id": meter_id, "error": str(e)})
 
@@ -859,8 +872,9 @@ def _train_isolation_forest(history_df, settings, state, meter_id):
         rolling_stds = pd.Series(flows).rolling(4, min_periods=1).std().fillna(0).values
 
         X = np.column_stack([flows, deltas, hours.values, dows.values, rolling_means, rolling_stds])
-        model = isolation_forest.train(X, contamination=settings.isolation_forest_contamination)
+        model, calibration_stats = isolation_forest.train(X, contamination=settings.isolation_forest_contamination)
         isolation_forest.save_model(model, settings.model_store_path, meter_id)
+        isolation_forest.save_calibration_stats(settings.model_store_path, meter_id, calibration_stats)
         model_registry.mark_trained(state, "isolation_forest")
         logger.info("Isolation Forest trained and saved", extra={"meter_id": meter_id})
         return model
